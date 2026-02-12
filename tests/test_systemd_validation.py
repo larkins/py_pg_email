@@ -20,7 +20,9 @@ class ServiceValidator:
     """Validates systemd service file syntax and configuration."""
     
     def __init__(self):
-        self.project_root = Path('/home/mal/git/py_pg_email')
+        # Detect project root from script location
+        script_dir = Path(__file__).parent.parent
+        self.project_root = script_dir
         self.errors = []
         self.warnings = []
     
