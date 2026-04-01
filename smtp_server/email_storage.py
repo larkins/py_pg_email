@@ -208,7 +208,7 @@ def store_email(sender: str, recipient: str, message: EmailMessage, raw_data: by
         recipient_user = cursor.fetchone()
         
         if not recipient_user:
-            local_domains = ['protophysics.com.au', 'localhost', 'example.com']
+            local_domains = ['protophysics.com.au', 'localhost', 'example.com', 'agieth.ai']
             recipient_domain = recipient.split('@')[-1].lower() if '@' in recipient else ''
             
             if recipient_domain in local_domains:
