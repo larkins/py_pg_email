@@ -11,9 +11,9 @@ import time
 
 # Configuration
 BASE_URL = "http://localhost:5003"
-EMAIL = "michael@protophysics.com.au"
-PASSWORD = "password123"
-RECIPIENT = "mjlarkins@gmail.com"
+EMAIL = "user@example.com"
+PASSWORD = "change-me-password"
+RECIPIENT = "recipient@example.net"
 IMAGE_PATH = Path(__file__).parent / "mime_test_image.png"
 
 def get_auth_token():
@@ -147,7 +147,7 @@ def send_and_verify():
             print(f"\n{'='*60}")
             print(f"✓ SUCCESS! Email {email_id} delivered to Gmail")
             print(f"{'='*60}")
-            print(f"\nPlease check mjlarkins@gmail.com for:")
+            print(f"\nPlease check {RECIPIENT} for:")
             print(f"  Subject: '✓ MIME Test: Embedded Image - {IMAGE_PATH.stem}'")
             print(f"\nThe image should display inline in the email body.")
             return email_id
