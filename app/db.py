@@ -177,14 +177,11 @@ def ensure_domains_table():
 
 
 def get_seed_domains():
-	"""Return the local domains that should exist in the domains table."""
-	seed_domains = {
-		'protophysics.com.au',
-		'protophysics.com',
-		'agieth.ai',
-		'fencemate.ai',
-		'persityle.ai',
-	}
+	"""Return the local domains that should exist in the domains table.
+	
+	Override via DOMAINS env var (comma-separated list).
+	"""
+	seed_domains = set()
 
 	env_domains = os.getenv('DOMAINS', '')
 	for value in env_domains.split(','):
