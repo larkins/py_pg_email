@@ -29,11 +29,17 @@ FIXTURE_PASSWORD = os.environ.get('MAIL_TEST_PASSWORD', 'not-a-real-password')
 # ---------------------------------------------------------------------------
 
 _postgres_pw = os.environ.get('POSTGRES_PASSWORD_TEST')
-if not _postgres_pw:
+# MAIL_TEST_DATABASE_URL lets a runner point the suite at a test database
+# with a role it already has credentials for, instead of the postgres
+# superuser. When it is set, POSTGRES_PASSWORD_TEST is not required.
+_test_db_url = os.environ.get('MAIL_TEST_DATABASE_URL')
+if not _test_db_url and not _postgres_pw:
     sys.stderr.write(
         '\n'
         '====================================================================\n'
-        '  py_pg_email tests require POSTGRES_PASSWORD_TEST env var.\n'
+        '\n====================================================================\n'
+        '  py_pg_email tests require POSTGRES_PASSWORD_TEST env var\n'
+        '  (or MAIL_TEST_DATABASE_URL for a full connection URL).\n'
         '  See tests/conftest.py for full context.\n'
         '  Example:\n'
         '    POSTGRES_PASSWORD_TEST="<postgres role pw>" pytest tests/\n'
@@ -45,7 +51,7 @@ if not _postgres_pw:
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 os.environ['TESTING'] = 'true'
-os.environ['DATABASE_URL'] = 'postgresql://postgres:{}@localhost:5432/mail_server_test'.format(_postgres_pw)
+os.environ['DATABASE_URL'] = _test_db_url or 'postgresql://postgres:{}@localhost:5432/mail_server_test'.format(_postgres_pw)
 os.environ['JWT_SECRET'] = 'test-secret-key'
 os.environ['SMTP2GO_WEBHOOK_SECRET'] = ''
 
