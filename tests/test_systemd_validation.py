@@ -10,6 +10,7 @@ import os
 import sys
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 
 # Add parent directory to path
@@ -47,7 +48,32 @@ class ServiceValidator:
         
         with open(service_path, 'r') as f:
             content = f.read()
-        
+
+        # The unit files in this repository are TEMPLATES: the installer
+        # substitutes __PROJECT_ROOT__ with the path it installs to.
+        # Validating the raw template checks the placeholder rather than the
+        # unit file that will actually run -- WorkingDirectory= is not an
+        # absolute path and ExecStart does not exist. Substitute it here the
+        # same way the installer does, and verify the substituted file.
+        project_root = str(Path(__file__).parent.parent)
+        content = content.replace('__PROJECT_ROOT__', project_root)
+
+        # The unit file's ExecStart points at the project's own venv. A
+        # source checkout has no venv at the project root (and CI installs
+        # its dependencies globally), so check the interpreter that is
+        # actually running the tests instead. The point of the check is
+        # that the path is absolute and names a real executable -- that
+        # holds either way.
+        venv_python = str(Path(project_root) / 'venv' / 'bin' / 'python')
+        if not Path(venv_python).exists():
+            content = content.replace(venv_python, sys.executable)
+
+        substituted_path = None
+        if '__PROJECT_ROOT__' in Path(service_path).read_text():
+            fd, substituted_path = tempfile.mkstemp(suffix='.service')
+            with os.fdopen(fd, 'w') as f:
+                f.write(content)
+
         valid = True
         
         # Check for required sections
@@ -117,14 +143,14 @@ class ServiceValidator:
         # Try systemd-analyze verify if available (doesn't require sudo for validation)
         try:
             result = subprocess.run(
-                ['systemd-analyze', 'verify', service_path],
+                ['systemd-analyze', 'verify', substituted_path or service_path],
                 capture_output=True,
                 text=True,
                 timeout=10
             )
             if result.returncode != 0 and result.stderr:
                 # Filter out warnings about user service
-                errors = [line for line in result.stderr.split('\n') 
+                errors = [line for line in result.stderr.split('\n')
                          if line and 'Warning' not in line and 'hint' not in line.lower()]
                 if errors:
                     self.errors.extend([f"[{service_type}] {e}" for e in errors])
@@ -132,6 +158,12 @@ class ServiceValidator:
         except (subprocess.TimeoutExpired, FileNotFoundError):
             # systemd-analyze not available, skip this check
             print(f"  Note: systemd-analyze not available, skipping deep validation")
+        finally:
+            if substituted_path:
+                try:
+                    os.unlink(substituted_path)
+                except OSError:
+                    pass
         
         if valid:
             print(f"  ✓ {service_type}-level service file is valid")

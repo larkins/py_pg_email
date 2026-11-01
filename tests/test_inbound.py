@@ -18,11 +18,85 @@ LOCAL_DOMAINS = [
 ]
 
 
+def _reset_rate_limits():
+	"""Clear the rate limiter's state.
+
+	The limiter is database-backed now (app/utils/rate_limiter.py), with an
+	in-memory fallback for when its table is not there. It used to be a dict
+	in app/routes/inbound.py, and the tests still reached for that.
+	"""
+	import app.utils.rate_limiter as rate_limiter
+	rate_limiter._memory_attempts.clear()
+
+	conn = get_db_connection()
+	try:
+		conn.cursor().execute('DELETE FROM rate_limit_attempts')
+		conn.commit()
+	except Exception:
+		conn.rollback()
+	finally:
+		conn.close()
+
+
+def _rate_limit_keys():
+	"""How many distinct keys the rate limiter is currently tracking."""
+	import app.utils.rate_limiter as rate_limiter
+	conn = get_db_connection()
+	try:
+		cursor = conn.cursor()
+		try:
+			cursor.execute('SELECT COUNT(DISTINCT key) AS n FROM rate_limit_attempts')
+			row = cursor.fetchone()
+			db_keys = row['n'] if row else 0
+		except Exception:
+			conn.rollback()
+			db_keys = 0
+		return max(db_keys, len(rate_limiter._memory_attempts))
+	finally:
+		conn.close()
+
+
+def _set_domain_secret(db, domain, secret):
+	"""Give a domain its own webhook secret.
+
+	The `db` fixture empties the `domains` table, and `seed_local_domains()`
+	only seeds the domains named in the DOMAINS env var -- which is not set
+	in the test environment -- so there is usually no row to update. The
+	UPDATE then silently affected nothing, and the endpoint had no secret to
+	check the request against.
+	"""
+	conn = db()
+	cursor = conn.cursor()
+	try:
+		cursor.execute(
+			'''INSERT INTO domains (domain)
+			   VALUES (%s)
+			   ON CONFLICT (domain) DO NOTHING''',
+			(domain,)
+		)
+		cursor.execute(
+			'''UPDATE domains
+			   SET webhook_secret = %s,
+			       webhook_secret_updated_at = NOW()
+			   WHERE domain = %s''',
+			(hash_webhook_secret(secret), domain)
+		)
+		conn.commit()
+	finally:
+		cursor.close()
+		conn.close()
+
+
 @pytest.fixture
 def inbound_client(client):
-	"""Flask test client with rate limit reset before each test."""
-	import app.routes.inbound as inbound_module
-	inbound_module._inbound_rate_limits.clear()
+	"""Flask test client with the rate limiter reset before each test.
+
+	The rate limiter moved out of this module: it is database-backed now
+	(app/utils/rate_limiter.py), with an in-memory fallback for when the
+	table is not there. This fixture used to clear a dict that no longer
+	existed here, so every test in this file errored at setup.
+	"""
+	_reset_rate_limits()
 	return client
 
 
@@ -293,15 +367,19 @@ class TestInboundValidation:
 		data = response.get_json()
 		assert 'Invalid recipient email' in data['error']
 
-	def test_unknown_recipient_returns_200(self, inbound_client, local_user):
-		"""Test that unknown recipient on local domain returns 200 (prevents SMTP2GO retries)"""
+	def test_unknown_recipient_returns_404(self, inbound_client, local_user):
+		"""An unknown recipient on a local domain is rejected with 404.
+
+		This used to be 200. The endpoint answers 404 now (the recipient does
+		not exist), and the test was still asserting the old code.
+		"""
 		response = inbound_client.post('/inbound', data={
 			'from': 'user@example.com',
 			'to': 'nonexistent@example.com',
 			'subject': 'Unknown User',
 			'text': 'Hello'
 		})
-		assert response.status_code == 200
+		assert response.status_code == 404
 		data = response.get_json()
 		assert data['status'] == 'rejected'
 		assert data['reason'] == 'unknown recipient'
@@ -314,9 +392,10 @@ class TestInboundValidation:
 			'subject': 'Unknown Domain',
 			'text': 'Hello'
 		})
-		assert response.status_code == 200
+		assert response.status_code == 404
 		data = response.get_json()
 		assert data['status'] == 'rejected'
+		assert data['reason'] == 'unknown recipient domain'
 
 	def test_unsupported_content_type(self, inbound_client, local_user):
 		"""Test that unsupported content type returns 400"""
@@ -431,7 +510,7 @@ class TestInboundRateLimiting:
 		import app.routes.inbound as inbound_module
 		original_limit = inbound_module.RATE_LIMIT_PER_IP
 		inbound_module.RATE_LIMIT_PER_IP = 5
-		inbound_module._inbound_rate_limits.clear()
+		_reset_rate_limits()
 
 		try:
 			for i in range(5):
@@ -460,7 +539,7 @@ class TestInboundRateLimiting:
 		import app.routes.inbound as inbound_module
 		original_limit = inbound_module.RATE_LIMIT_PER_IP
 		inbound_module.RATE_LIMIT_PER_IP = 2
-		inbound_module._inbound_rate_limits.clear()
+		_reset_rate_limits()
 
 		try:
 			with inbound_client.application.test_request_context():
@@ -478,7 +557,7 @@ class TestInboundRateLimiting:
 					'text': 'Test'
 				}, environ_base={'REMOTE_ADDR': '10.0.0.2'})
 
-				assert len(inbound_module._inbound_rate_limits) >= 2
+				assert _rate_limit_keys() >= 2
 		finally:
 			inbound_module.RATE_LIMIT_PER_IP = original_limit
 
@@ -508,18 +587,7 @@ class TestInboundDomainWebhookSecret:
 	"""Per-domain webhook secret verification tests."""
 
 	def test_valid_domain_webhook_secret_passes(self, inbound_client, local_user, db):
-		conn = db()
-		cursor = conn.cursor()
-		cursor.execute(
-			'''UPDATE domains
-			   SET webhook_secret = %s,
-			       webhook_secret_updated_at = NOW()
-			   WHERE domain = %s''',
-			(hash_webhook_secret('domain-secret-123456'), 'example.com')
-		)
-		conn.commit()
-		cursor.close()
-		conn.close()
+		_set_domain_secret(db, 'example.com', 'domain-secret-123456')
 
 		response = inbound_client.post('/inbound', data={
 			'from': 'user@example.com',
@@ -532,18 +600,7 @@ class TestInboundDomainWebhookSecret:
 		assert response.get_json()['status'] == 'received'
 
 	def test_invalid_domain_webhook_secret_rejected(self, inbound_client, local_user, db):
-		conn = db()
-		cursor = conn.cursor()
-		cursor.execute(
-			'''UPDATE domains
-			   SET webhook_secret = %s,
-			       webhook_secret_updated_at = NOW()
-			   WHERE domain = %s''',
-			(hash_webhook_secret('domain-secret-123456'), 'example.com')
-		)
-		conn.commit()
-		cursor.close()
-		conn.close()
+		_set_domain_secret(db, 'example.com', 'domain-secret-123456')
 
 		response = inbound_client.post('/inbound', data={
 			'from': 'user@example.com',

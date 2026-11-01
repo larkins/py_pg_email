@@ -10,6 +10,7 @@ Tests all security features:
 
 import pytest
 import time
+import dns.resolver
 from datetime import datetime, timedelta
 from unittest.mock import Mock, patch, MagicMock
 import sys
@@ -133,7 +134,10 @@ class TestSPFValidator:
     def test_spf_no_record(self, mock_resolve, mock_is_internal):
         """Test SPF validation when no SPF record exists."""
         mock_is_internal.return_value = False
-        mock_resolve.side_effect = Exception("No answer")
+        # The real "there is no TXT record" answer is dns.resolver.NoAnswer.
+        # A generic Exception is a temporary error to pyspf, which returns
+        # 'temperror' rather than 'none'.
+        mock_resolve.side_effect = dns.resolver.NoAnswer()
         
         spf = SPFValidator()
         result, explanation = spf.validate('203.0.113.1', 'test@example.com')
@@ -190,12 +194,13 @@ class TestGreylistManager:
         """Test new sender is greylisted."""
         # Clean up any existing entries first
         import psycopg2
-        conn = psycopg2.connect(os.environ.get(
-        'MAIL_SERVER_TEST_DSN',
-        # Fallback: parse DATABASE_URL set by conftest.py. Test DB is
-        # postgres-owned so the postgres password works for tests.
-        'postgresql://postgres:' + os.environ['POSTGRES_PASSWORD_TEST'] + '@localhost:5432/mail_server_test'
-    ))
+        # The DSN the conftest resolved for this run. The old fallback
+        # hardcoded localhost:5432/mail_server_test -- a database that
+        # exists on the LIVE production Postgres -- and this test DELETEs
+        # from the greylist table.
+        conn = psycopg2.connect(
+            os.environ.get('MAIL_SERVER_TEST_DSN') or os.environ['DATABASE_URL']
+        )
         cursor = conn.cursor()
         cursor.execute('''
             DELETE FROM greylist 
@@ -238,12 +243,13 @@ class TestGreylistManager:
         
         # Clean up any existing entry first
         import psycopg2
-        conn = psycopg2.connect(os.environ.get(
-        'MAIL_SERVER_TEST_DSN',
-        # Fallback: parse DATABASE_URL set by conftest.py. Test DB is
-        # postgres-owned so the postgres password works for tests.
-        'postgresql://postgres:' + os.environ['POSTGRES_PASSWORD_TEST'] + '@localhost:5432/mail_server_test'
-    ))
+        # The DSN the conftest resolved for this run. The old fallback
+        # hardcoded localhost:5432/mail_server_test -- a database that
+        # exists on the LIVE production Postgres -- and this test DELETEs
+        # from the greylist table.
+        conn = psycopg2.connect(
+            os.environ.get('MAIL_SERVER_TEST_DSN') or os.environ['DATABASE_URL']
+        )
         cursor = conn.cursor()
         cursor.execute('''
             DELETE FROM greylist 

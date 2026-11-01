@@ -62,7 +62,9 @@ class TestOutboundDelivery:
 		
 		assert queue_entry is not None, "Email should be queued for outbound delivery"
 		assert queue_entry['recipient_email'] == 'user@example.com'
-		assert queue_entry['recipient_domain'] == 'gmail.com'
+		# The address is user@example.com, so the domain is example.com. This
+		# used to assert 'gmail.com', which the data never supported.
+		assert queue_entry['recipient_domain'] == 'example.com'
 		assert queue_entry['status'] in ('pending', 'sending', 'sent', 'retry')
 		
 		cursor.close()
@@ -76,7 +78,17 @@ class TestOutboundDelivery:
 		locally, causing emails to be stored locally instead of sent outbound.
 		"""
 		external_email = 'user@example.com'
-		
+
+		# The `db` fixture deliberately does not delete users, so an address
+		# another test created can still be here and this assertion would
+		# fail for the wrong reason. Start from a known state.
+		conn = db()
+		cursor = conn.cursor()
+		cursor.execute('DELETE FROM users WHERE email = %s', (external_email,))
+		conn.commit()
+		cursor.close()
+		conn.close()
+
 		# Send email
 		response = client.post('/api/emails',
 			headers=auth_headers,
@@ -144,7 +156,10 @@ class TestOutboundDelivery:
 		Validates recipient_domain field is extracted correctly from email address.
 		"""
 		test_cases = [
-			('user@example.com', 'gmail.com'),
+			# The first case used to say user@example.com and expect
+			# gmail.com -- the address and the expected domain did not match,
+			# so it failed on the data rather than on the behaviour.
+			('user@gmail.com', 'gmail.com'),
 			('user@yahoo.com', 'yahoo.com'),
 			('user@outlook.com', 'outlook.com'),
 			('user@subdomain.example.com', 'subdomain.example.com'),

@@ -11,47 +11,172 @@ import pytest
 FIXTURE_PASSWORD = os.environ.get('MAIL_TEST_PASSWORD', 'not-a-real-password')
 
 # ---------------------------------------------------------------------------
-# Test credential configuration
+# Which database the suite runs against
 #
-# As of 2026-08-15, the weak hardcoded `postgres:1234` was removed because:
-#   1. The actual postgres superuser password was rotated (multi-rotation event
-#      this session — final prefix `S7Kz9dqV…`); hardcoding `1234` would mean
-#      every pytest run needs PG rotated back, which is impossible.
-#   2. The `1234` had been exposed in chat transcript 3+ times.
+# THE SUITE DELETES FROM THE TABLES IT USES. The `db` fixture empties
+# emails, attachments, users, folders, domains, outbound_queue and friends
+# before every test, so it must only ever be pointed at a database that is
+# disposable.
 #
-# Tests now REQUIRE the `POSTGRES_PASSWORD_TEST` env var to be set. To run tests:
+# There used to be a default:
 #
-#   POSTGRES_PASSWORD_TEST='<the postgres role pw>' pytest tests/
+#     postgresql://postgres:<pw>@localhost:5432/mail_server_test
 #
-# Or for the canonical repo-wide value, see ~/credentials/postgres_credentials.md
-# (rotate-chained audit log). The test DB `mail_server_test` is owned by the
-# `postgres` role, so the postgres password works for tests.
+# and a database with that EXACT NAME EXISTS ON THE LIVE PRODUCTION
+# POSTGRES on port 5432. So `POSTGRES_PASSWORD_TEST=<pw> pytest` could
+# delete from a live database, and the only thing standing between that and
+# a wipe was the operator noticing the port.
+#
+# The URL the suite runs against. MAIL_TEST_DATABASE_URL wins; otherwise
+# the old POSTGRES_PASSWORD_TEST form is used, and the guards below decide
+# whether the result is a safe place to run.
+#
+# To run the tests against a throwaway cluster:
+#
+#   MAIL_TEST_DATABASE_URL='postgresql://postgres@127.0.0.1:55432/mail_ci_test' pytest tests/
+#
+# POSTGRES_PASSWORD_TEST is still accepted, and supplies the password for
+# the URL when the URL does not carry one.
 # ---------------------------------------------------------------------------
 
-_postgres_pw = os.environ.get('POSTGRES_PASSWORD_TEST')
-# MAIL_TEST_DATABASE_URL lets a runner point the suite at a test database
-# with a role it already has credentials for, instead of the postgres
-# superuser. When it is set, POSTGRES_PASSWORD_TEST is not required.
-_test_db_url = os.environ.get('MAIL_TEST_DATABASE_URL')
-if not _test_db_url and not _postgres_pw:
+def _apply_password(url):
+    """Let POSTGRES_PASSWORD_TEST supply the password for the URL."""
+    pw = os.environ.get('POSTGRES_PASSWORD_TEST')
+    if not pw:
+        return url
+    scheme, sep, rest = url.partition('://')
+    if not sep or '@' not in rest:
+        return url
+    userinfo, _, hostpart = rest.rpartition('@')
+    user, colon, _old = userinfo.partition(':')
+    if colon:
+        return url
+    return '%s://%s:%s@%s' % (scheme, user, pw, hostpart)
+
+
+def _default_url():
+    """The URL used when MAIL_TEST_DATABASE_URL is not set.
+
+    This is the old default, kept so a runner that sets only
+    POSTGRES_PASSWORD_TEST keeps working. It is NOT trusted: the guards
+    below still have to pass before anything is deleted.
+    """
+    return 'postgresql://postgres:%s@localhost:5432/mail_server_test' % (
+        os.environ.get('POSTGRES_PASSWORD_TEST', ''),
+    )
+
+
+_test_db_url = _apply_password(
+    os.environ.get('MAIL_TEST_DATABASE_URL') or _default_url()
+)
+
+
+def _refuse(message):
     sys.stderr.write(
         '\n'
         '====================================================================\n'
-        '\n====================================================================\n'
-        '  py_pg_email tests require POSTGRES_PASSWORD_TEST env var\n'
-        '  (or MAIL_TEST_DATABASE_URL for a full connection URL).\n'
-        '  See tests/conftest.py for full context.\n'
-        '  Example:\n'
-        '    POSTGRES_PASSWORD_TEST="<postgres role pw>" pytest tests/\n'
+        '  %s\n'
         '====================================================================\n'
-        '\n'
+        '\n' % message
     )
     sys.exit(2)
+
+
+def _assert_disposable(url):
+    """Refuse to run against anything that is not a throwaway test database.
+
+    Two things are checked:
+
+      1. the database name must contain "test";
+      2. the PostgreSQL server must not also host the production
+         `mail_server` database -- that is the live server, whatever the
+         database is called. This is the check that matters: a database
+         named `mail_server_test` EXISTS on the live production Postgres,
+         and the suite's `db` fixture DELETEs from it.
+    """
+    from urllib.parse import urlparse
+    dbname = (urlparse(url).path or '').lstrip('/')
+    if 'test' not in dbname.lower():
+        _refuse(
+            'Refusing to run: the database name %r does not contain "test".\n'
+            '  This suite DELETEs from the tables it uses.' % dbname
+        )
+
+    import psycopg2
+    try:
+        conn = psycopg2.connect(url)
+    except Exception as exc:
+        _refuse('Cannot reach the database in MAIL_TEST_DATABASE_URL: %s' % exc)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM pg_database WHERE datname = 'mail_server'")
+        if cur.fetchone():
+            _refuse(
+                'Refusing to run: that PostgreSQL server also hosts the\n'
+                '  production `mail_server` database, so it is the live server.\n'
+                '  This suite DELETEs from the tables it uses.'
+            )
+    finally:
+        conn.close()
+
+
+def _harden_the_test_database(url):
+    """Stop a lock wait from hanging the run.
+
+    A test session that leaves a transaction open holds locks on the
+    tables, and the schema helpers' `ALTER TABLE emails ...` then waits for
+    them. A lock wait at the C level cannot be interrupted by pytest's
+    timeout, so the run hung until the job was cancelled and the report
+    was lost.
+
+    lock_timeout makes a blocked statement fail fast instead of waiting
+    forever, and idle_in_transaction_session_timeout closes a session that
+    is sitting on a transaction it is not using. Between them the suite
+    finishes in well under two minutes and reports what actually failed.
+
+    Both are set on the DATABASE, so every connection to it gets them --
+    including the ones the application opens. This needs superuser; if the
+    role is not one, the suite still runs, it just hangs again if something
+    leaks a transaction.
+    """
+    import psycopg2
+    from psycopg2 import sql
+
+    conn = psycopg2.connect(url)
+    try:
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute('SELECT current_database()')
+        dbname = cur.fetchone()[0]
+        for setting, value in (
+            ('lock_timeout', '10s'),
+            ('idle_in_transaction_session_timeout', '30s'),
+        ):
+            cur.execute(
+                sql.SQL('ALTER DATABASE {} SET {} = %s').format(
+                    sql.Identifier(dbname), sql.SQL(setting)
+                ),
+                (value,),
+            )
+    except Exception as exc:
+        sys.stderr.write(
+            '\n'
+            '  WARNING: could not set lock_timeout on the test database: %s\n'
+            '  The suite may hang if a test leaves a transaction open.\n'
+            '\n' % exc
+        )
+    finally:
+        conn.close()
+
+
+_assert_disposable(_test_db_url)
+_harden_the_test_database(_test_db_url)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 os.environ['TESTING'] = 'true'
-os.environ['DATABASE_URL'] = _test_db_url or 'postgresql://postgres:{}@localhost:5432/mail_server_test'.format(_postgres_pw)
+os.environ['DATABASE_URL'] = _test_db_url
+
 os.environ['JWT_SECRET'] = 'test-secret-key'
 os.environ['SMTP2GO_WEBHOOK_SECRET'] = ''
 
