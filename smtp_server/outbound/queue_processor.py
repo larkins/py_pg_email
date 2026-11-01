@@ -7,6 +7,8 @@ Background processor that delivers queued emails to external servers.
 import threading
 import time
 import logging
+import hashlib
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from typing import Optional, List
@@ -25,6 +27,104 @@ from .rate_limiter import OutboundRateLimiter
 from .dkim_signer import load_dkim_config, load_multi_domain_dkim
 
 logger = logging.getLogger(__name__)
+
+
+def _embedded_attachment_digests(msg):
+	"""Count attachment payloads already embedded in a parsed message.
+
+	Returns a Counter mapping the sha256 digest of each attachment payload
+	to how many parts carry that payload. Parts are matched on content
+	rather than filename, because the filename recorded in the attachments
+	table may have been sanitised differently from the one in the MIME.
+	"""
+	digests = Counter()
+	if msg is None:
+		return digests
+
+	try:
+		parts = msg.walk()
+	except AttributeError:
+		return digests
+
+	for part in parts:
+		if part.get_content_maintype() == 'multipart':
+			continue
+		if not part.get_filename():
+			continue
+		try:
+			payload = part.get_payload(decode=True)
+		except Exception:
+			payload = None
+		if not payload:
+			continue
+		digests[hashlib.sha256(payload).hexdigest()] += 1
+
+	return digests
+
+
+def attach_attachments(msg, attachments, email_id=None):
+	"""Attach files to a message, skipping any that are already embedded.
+
+	The MIME send path stores the attachment parts inside raw_email *and*
+	records the same files in the attachments table. Re-attaching every row
+	blindly therefore delivers each file twice. Matching on content digest
+	makes the step idempotent, while the counter still allows a sender to
+	deliberately attach the same file more than once.
+
+	Returns a (attached, skipped) tuple of filename lists.
+	"""
+	embedded = _embedded_attachment_digests(msg)
+	attached = []
+	skipped = []
+
+	for att in attachments:
+		try:
+			att_path = att['file_path']
+			file_name = att['file_name']
+			content_type = att['content_type']
+		except (KeyError, TypeError):
+			continue
+
+		if not att_path:
+			continue
+		if not os.path.isfile(att_path):
+			logger.warning(f"Attachment file not found: {att_path}, skipping")
+			continue
+
+		try:
+			with open(att_path, 'rb') as f:
+				file_data = f.read()
+		except OSError as e:
+			logger.error(f"Failed to read attachment {file_name} for email {email_id}: {e}")
+			continue
+
+		digest = hashlib.sha256(file_data).hexdigest()
+		if embedded[digest] > 0:
+			embedded[digest] -= 1
+			skipped.append(file_name)
+			logger.info(
+				f"Attachment {file_name} is already embedded in the message for "
+				f"email {email_id}, skipping duplicate"
+			)
+			continue
+
+		maintype = (content_type or 'application/octet-stream').split('/')[0]
+		subtype = (content_type or 'application/octet-stream').split('/')[-1]
+		try:
+			msg.add_attachment(
+				file_data,
+				maintype=maintype,
+				subtype=subtype,
+				filename=file_name
+			)
+		except Exception as e:
+			logger.error(f"Failed to attach {file_name} for email {email_id}: {e}")
+			continue
+
+		attached.append(file_name)
+		logger.info(f"Attached {file_name} ({len(file_data)} bytes) to email {email_id}")
+
+	return attached, skipped
 
 
 class OutboundQueueProcessor:
@@ -377,28 +477,12 @@ class OutboundQueueProcessor:
 			if attachments:
 				logger.info(f"Found {len(attachments)} attachment(s) for email {email_id}")
 			
-			for att in attachments:
-				att_path = att['file_path']
-				if not att_path:
-					continue
-				if not os.path.isfile(att_path):
-					logger.warning(f"Attachment file not found: {att_path}, skipping")
-					continue
-				
-				try:
-					with open(att_path, 'rb') as f:
-						file_data = f.read()
-					maintype = (att['content_type'] or 'application/octet-stream').split('/')[0]
-					subtype = (att['content_type'] or 'application/octet-stream').split('/')[-1]
-					msg.add_attachment(
-						file_data,
-						maintype=maintype,
-						subtype=subtype,
-						filename=att['file_name']
-					)
-					logger.info(f"Attached {att['file_name']} ({len(file_data)} bytes) to email {email_id}")
-				except Exception as e:
-					logger.error(f"Failed to attach {att['file_name']} for email {email_id}: {e}")
+			attached, skipped = attach_attachments(msg, attachments, email_id=email_id)
+			if skipped:
+				logger.info(
+					f"Skipped {len(skipped)} already-embedded attachment(s) for email {email_id}: "
+					f"{', '.join(skipped)}"
+				)
 			
 			# Sign with DKIM if configured (multi-domain aware)
 			signing_domain = from_address.split('@')[-1] if '@' in from_address else None

@@ -675,6 +675,75 @@ def create_mime_email():
 		if not msg.get('Subject'):
 			msg['Subject'] = 'No Subject'
 
+		# Validate attachment parts BEFORE the email is queued. The multipart
+		# upload endpoint and this endpoint must accept the same file types,
+		# and a rejected attachment must not leave a queued email behind.
+		from email.policy import default
+		from app.utils.attachment_policy import allowed_file, validate_bytes
+
+		parsed_msg = message_from_string(mime_content, policy=default)
+		mime_attachments = []
+		rejected_attachments = []
+
+		for part in parsed_msg.walk():
+			if part.get_content_maintype() == 'multipart':
+				continue
+
+			filename = part.get_filename()
+			if not filename:
+				continue
+
+			# Inline parts are the message body, not attachments.
+			if 'inline' in part.get('Content-Disposition', ''):
+				continue
+
+			try:
+				payload = part.get_payload(decode=True)
+			except Exception:
+				payload = None
+			if not payload:
+				continue
+
+			try:
+				clean_filename = _sanitize_string(_strip_newlines(filename))[:255]
+			except Exception:
+				clean_filename = 'attachment.bin'
+			if not clean_filename:
+				continue
+
+			if not allowed_file(clean_filename):
+				rejected_attachments.append(
+					f"{clean_filename} (file type not allowed)"
+				)
+				continue
+
+			is_valid, detected_mime, error_msg = validate_bytes(payload, clean_filename)
+			if not is_valid:
+				rejected_attachments.append(f"{clean_filename} ({error_msg})")
+				continue
+
+			content_type = part.get_content_type()
+			if len(content_type or '') > 255:
+				content_type = 'application/octet-stream'
+
+			mime_attachments.append({
+				'file_name': clean_filename,
+				'content_type': detected_mime
+					if detected_mime != 'application/octet-stream' else content_type,
+				'payload': payload,
+				'file_size': len(payload),
+			})
+
+		if rejected_attachments:
+			logger.warning(
+				f"MIME email rejected: {len(rejected_attachments)} attachment(s) failed "
+				f"validation: {', '.join(rejected_attachments)}"
+			)
+			return jsonify({
+				'error': 'Attachment rejected: ' + '; '.join(rejected_attachments),
+				'rejected_attachments': rejected_attachments,
+			}), 400
+
 		# Import and use the queue function
 		from smtp_server.outbound.storage import queue_outbound_email
 
@@ -707,9 +776,9 @@ def create_mime_email():
 
 		logger.info(f"MIME email queued: ID={email_id}, recipients={to_addresses} (cc={len(normalized_cc)})")
 		
-		# Extract and save attachments from MIME content (matching the inbound attachment pattern)
-		from email.policy import default
-		import io
+		# Save the validated attachments to disk and record them. The parts are
+		# already embedded in raw_email, so the delivery step skips re-adding
+		# them (see attach_attachments in smtp_server/outbound/queue_processor.py).
 		import uuid as uuid_mod
 
 		UPLOADS_DIR = os.path.join(
@@ -717,47 +786,11 @@ def create_mime_email():
 		)
 		os.makedirs(UPLOADS_DIR, exist_ok=True)
 
-		parsed_msg = message_from_string(mime_content, policy=default)
+		for att in mime_attachments:
+			clean_filename = att['file_name']
+			payload = att['payload']
+			file_size = att['file_size']
 
-		for part in parsed_msg.walk():
-			content_disposition = part.get('Content-Disposition', '')
-			content_type = part.get_content_type()
-
-			# Skip multipart containers
-			if part.get_content_maintype() == 'multipart':
-				continue
-
-			# Only include parts with attachment content-disposition and a filename
-			filename = part.get_filename()
-			if not filename:
-				continue
-
-			# Skip inline parts that are the body (text, html)
-			if 'inline' in content_disposition:
-				continue
-
-			content_type = part.get_content_type()
-
-			# Get decoded payload
-			try:
-				payload = part.get_payload(decode=True)
-				if not payload:
-					continue
-				file_size = len(payload)
-			except Exception:
-				continue
-
-			# Sanitize filename + truncate to schema limit (255 chars)
-			try:
-				clean_filename = _sanitize_string(_strip_newlines(filename))[:255]
-			except Exception:
-				clean_filename = 'attachment.bin'
-			if not clean_filename:
-				continue
-			if len(content_type or '') > 255:
-				content_type = 'application/octet-stream'
-
-			# Save the file to disk (mirrors the inbound attachment pattern)
 			unique_filename = str(uuid_mod.uuid4())
 			ext = clean_filename.rsplit('.', 1)[-1].lower() if '.' in clean_filename else ''
 			if ext:
@@ -778,7 +811,7 @@ def create_mime_email():
 				cursor.execute(
 					f'''INSERT INTO {cfg.t("attachments")} (email_id, file_name, content_type, file_size, file_path, created_at)
 					   VALUES (%s, %s, %s, %s, %s, NOW()) RETURNING id''',
-					(email_id, clean_filename, content_type, file_size, file_path)
+					(email_id, clean_filename, att['content_type'], file_size, file_path)
 				)
 				attachment_id = cursor.fetchone()['id']
 				conn.commit()
@@ -792,7 +825,7 @@ def create_mime_email():
 			finally:
 				cursor.close()
 				conn.close()
-		
+
 		# Pull the generated Message-ID + thread_id back from the stored Sent row.
 		stored_message_id = msg.get('Message-ID', '').strip().lstrip('<').rstrip('>') or None
 		conn = get_db_connection()

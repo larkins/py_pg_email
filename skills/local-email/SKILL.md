@@ -365,6 +365,12 @@ correct sender (defaults to `EMAIL_ADDRESS` otherwise).
 
 You can combine `--cc` with `--attachment`; the same CC semantics apply.
 
+The permitted file types are a single policy shared with the attachment
+upload endpoint. `GET /api/attachments/allowed-types` returns the current
+list (and the maximum file size) if you need to check before sending. A
+file that is not permitted is rejected with HTTP 400 and the offending
+filename in the error — it is never dropped without a word.
+
 #### Send a prebuilt MIME message from a file
 
 For full control over the MIME structure (e.g. when you've already built a

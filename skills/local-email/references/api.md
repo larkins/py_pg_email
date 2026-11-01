@@ -85,6 +85,13 @@ relay (such as SMTP2GO) accepts the message.
 | `GET` | `/api/emails/{id}/attachments` | List attachments for an email |
 | `GET` | `/api/attachments/{id}` | Download an attachment |
 | `DELETE` | `/api/attachments/{id}` | Delete an attachment |
+| `GET` | `/api/attachments/allowed-types` | The file types that may be attached |
+
+Both `/api/emails/{id}/attachments` and `/api/emails/mime` apply the same
+policy, so a file accepted by one is accepted by the other. A rejected
+attachment is reported by name (HTTP 400) rather than dropped silently, and
+`/api/emails/mime` validates before the email is queued, so a rejected
+attachment never leaves a queued email behind.
 
 ### Blacklist
 
