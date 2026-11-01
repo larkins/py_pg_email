@@ -311,7 +311,7 @@ def remove_blacklisted_ip(entry_id):
 	
 	# Get the IP address before deleting
 	cursor.execute(
-		'SELECT ip_address::text FROM {cfg.t("ip_blacklist")} WHERE id = %s',
+		f'SELECT ip_address::text FROM {cfg.t("ip_blacklist")} WHERE id = %s',
 		(entry_id,)
 	)
 	result = cursor.fetchone()
@@ -329,7 +329,7 @@ def remove_blacklisted_ip(entry_id):
 	cursor.close()
 	conn.close()
 	
-	logger.info(f"IP {ip_address} (entry {entry_id}) removed from {cfg.t("blacklist")} by user {request.current_user['id']}")
+	logger.info(f"IP {ip_address} (entry {entry_id}) removed from {cfg.t("ip_blacklist")} by user {request.current_user['id']}")
 	
 	return jsonify({
 		'status': 'removed',
@@ -352,11 +352,11 @@ def remove_blacklisted_ip_by_address(ip_address):
 	    name: ip_address
 	    type: string
 	    required: true
-	    description: IP address to remove from {cfg.t("blacklist")}
+	    description: IP address to remove from the ip_blacklist table
 	    example: "192.168.1.100"
 	responses:
 	  200:
-	    description: IP removed from {cfg.t("blacklist")}
+	    description: IP removed from the ip_blacklist table
 	    schema:
 	      type: object
 	      properties:
@@ -375,7 +375,7 @@ def remove_blacklisted_ip_by_address(ip_address):
 	
 	# Delete the entry
 	cursor.execute(
-		'DELETE FROM {cfg.t("ip_blacklist")} WHERE ip_address = %s::inet RETURNING id',
+		f'DELETE FROM {cfg.t("ip_blacklist")} WHERE ip_address = %s::inet RETURNING id',
 		(ip_address,)
 	)
 	result = cursor.fetchone()
@@ -389,7 +389,7 @@ def remove_blacklisted_ip_by_address(ip_address):
 	cursor.close()
 	conn.close()
 	
-	logger.info(f"IP {ip_address} removed from {cfg.t("blacklist")} by user {request.current_user['id']}")
+	logger.info(f"IP {ip_address} removed from {cfg.t("ip_blacklist")} by user {request.current_user['id']}")
 	
 	return jsonify({
 		'status': 'removed',

@@ -3,6 +3,8 @@ import uuid
 
 import app.routes.auth as auth_module
 
+from app.db import get_db_connection
+
 
 
 # Fixture credential for the TEST database only. It comes from the
@@ -14,8 +16,24 @@ SECURE_FIXTURE_PASSWORD = os.environ.get('MAIL_TEST_SECURE_PASSWORD', 'not-a-rea
 
 
 def reset_login_state():
-	auth_module._failed_login_attempts.clear()
-	auth_module._login_lockouts.clear()
+	"""Clear the brute-force protection's state.
+
+	The failed-login tracking moved to the shared rate limiter
+	(app/utils/rate_limiter.py) -- it is database-backed now, with an
+	in-memory fallback -- so the two dicts this used to clear no longer
+	exist here.
+	"""
+	import app.utils.rate_limiter as rate_limiter
+	rate_limiter._memory_attempts.clear()
+
+	conn = get_db_connection()
+	try:
+		conn.cursor().execute('DELETE FROM rate_limit_attempts')
+		conn.commit()
+	except Exception:
+		conn.rollback()
+	finally:
+		conn.close()
 
 
 class TestAuth:
